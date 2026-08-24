@@ -12,6 +12,7 @@ from streamlit_folium import st_folium
 st.set_page_config(page_title="Fungo Predictor", page_icon="🍄", layout="wide")
 
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
+ELEVATION_API = "https://api.open-meteo.com/v1/elevation"
 NOMINATIM = "https://nominatim.openstreetmap.org/reverse"
 LOMBARDIA_STAZIONI = "https://www.dati.lombardia.it/resource/nf78-nj6b.json"
 LOMBARDIA_DATI = "https://www.dati.lombardia.it/resource/647i-nhxk.json"
@@ -137,7 +138,61 @@ def nearest_candidates(stations, lat, lon, elevation, max_km):
     return out.sort_values(["score", "distance_km"]).reset_index(drop=True)
 
 
-def build_forecast(raw, observed_rain=None):
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def terrain_analysis(lat, lon, spacing_m=120):
+    """Stima quota, pendenza ed esposizione da una griglia altimetrica 3x3."""
+    lat_step = spacing_m / 111320.0
+    lon_step = spacing_m / (111320.0 * math.cos(math.radians(lat)))
+    points = []
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            points.append((lat + dy * lat_step, lon + dx * lon_step))
+    response = requests.get(
+        ELEVATION_API,
+        params={
+            "latitude": ",".join(f"{x[0]:.6f}" for x in points),
+            "longitude": ",".join(f"{x[1]:.6f}" for x in points),
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    z = response.json().get("elevation", [])
+    if len(z) != 9 or any(v is None for v in z):
+        raise ValueError("Griglia altimetrica incompleta")
+    # Matrice: righe sud-centro-nord, colonne ovest-centro-est.
+    west = (z[0] + 2 * z[3] + z[6]) / 4
+    east = (z[2] + 2 * z[5] + z[8]) / 4
+    south = (z[0] + 2 * z[1] + z[2]) / 4
+    north = (z[6] + 2 * z[7] + z[8]) / 4
+    dzdx = (east - west) / (2 * spacing_m)
+    dzdy = (north - south) / (2 * spacing_m)
+    slope_rad = math.atan(math.sqrt(dzdx ** 2 + dzdy ** 2))
+    slope_deg = math.degrees(slope_rad)
+    slope_pct = math.tan(slope_rad) * 100
+    # Direzione di massima discesa, azimut da Nord in senso orario.
+    aspect_deg = (math.degrees(math.atan2(-dzdx, -dzdy)) + 360) % 360
+    if slope_deg < 2:
+        aspect = "Pianeggiante"
+    else:
+        names = ["Nord", "Nord-est", "Est", "Sud-est", "Sud", "Sud-ovest", "Ovest", "Nord-ovest"]
+        aspect = names[int((aspect_deg + 22.5) // 45) % 8]
+    return {
+        "elevation": float(z[4]), "slope_deg": slope_deg,
+        "slope_pct": slope_pct, "aspect": aspect, "aspect_deg": aspect_deg,
+    }
+
+
+def terrain_bonus(aspect, slope_deg):
+    base = {
+        "Nord": 4, "Nord-est": 3, "Nord-ovest": 3, "Est": 2,
+        "Ovest": 0, "Sud-est": -3, "Sud-ovest": -3, "Sud": -4,
+        "Pianeggiante": 0,
+    }.get(aspect, 0)
+    factor = clamp(slope_deg / 18.0, 0.25, 1.5) if slope_deg >= 2 else 0
+    return round(base * factor)
+
+def build_forecast(raw, observed_rain=None, forest_type="Non nota", exposure_bonus_value=0):
     daily = pd.DataFrame(raw["daily"])
     daily["time"] = pd.to_datetime(daily["time"])
     daily["date"] = daily["time"].dt.date
@@ -152,6 +207,12 @@ def build_forecast(raw, observed_rain=None):
     if observed_rain is not None and not observed_rain.empty:
         rain.update(observed_rain.set_index("date")["rain"].astype(float).to_dict())
     future = daily[daily["date"] >= date.today()].head(7).copy()
+    forest_bonus = {
+        "Non nota": 0, "Faggio": 5, "Castagno": 4,
+        "Quercia": 2, "Conifere": 1, "Bosco misto": 4,
+    }.get(forest_type, 0)
+    exposure_bonus = exposure_bonus_value
+
     rows = []
     for _, r in future.iterrows():
         day = r["date"]
@@ -169,6 +230,7 @@ def build_forecast(raw, observed_rain=None):
         score = clamp(rain7 / 50 * 32, 0, 32) + wait_score + clamp((humidity - 45) / 40 * 18, 0, 18)
         score += clamp((soil - .10) / .28 * 16, 0, 16) + clamp(14 - abs(temp - 16) * 1.8, 0, 14)
         score -= clamp((wind - 12) * .8, 0, 10)
+        score += forest_bonus + exposure_bonus
         rows.append({"Data": pd.Timestamp(day), "Indice": round(clamp(score)),
                      "Pioggia prevista (mm)": round(float(r["precipitation_sum"] or 0), 1),
                      "Pioggia 7 gg precedenti (mm)": round(rain7, 1),
@@ -189,6 +251,15 @@ with st.sidebar:
     max_km = st.slider("Raggio massimo di ricerca", 20, 100, 50, 5)
     max_alt_diff = st.slider("Differenza quota preferenziale", 100, 1000, 250, 50)
     st.caption("Una centralina è consigliata se rispetta sia il raggio preferenziale sia la differenza di quota.")
+
+    st.header("Caratteristiche del bosco")
+    forest_type = st.selectbox(
+        "Prevalenza del bosco",
+        ["Non nota", "Faggio", "Castagno", "Quercia", "Conifere", "Bosco misto"],
+        help="Modifica l'indice stimato in funzione della maggiore o minore capacità del bosco di conservare umidità."
+    )
+    st.caption("L'esposizione e la pendenza vengono calcolate automaticamente dalle coordinate. Il bosco applica un correttivo limitato all'indice.")
+
     if st.button("Cancella punto", use_container_width=True):
         for key in ["point", "source_choice", "station_id"]:
             st.session_state.pop(key, None)
@@ -198,7 +269,17 @@ center = [44.75, 9.10]
 m = folium.Map(location=center, zoom_start=7, tiles="OpenStreetMap")
 if "point" in st.session_state:
     p = st.session_state["point"]
-    folium.Marker([p["lat"], p["lon"]], tooltip="Punto selezionato").add_to(m)
+    folium.Marker(
+        [p["lat"], p["lon"]],
+        tooltip="Punto selezionato",
+        icon=folium.DivIcon(
+            icon_size=(34, 44), icon_anchor=(17, 42),
+            html="""<div style="width:34px;height:34px;border-radius:50% 50% 50% 0;
+            background:#dc2626;border:4px solid white;box-shadow:0 2px 8px rgba(0,0,0,.45);
+            transform:rotate(-45deg);display:flex;align-items:center;justify-content:center">
+            <div style="width:10px;height:10px;border-radius:50%;background:white"></div></div>""",
+        ),
+    ).add_to(m)
 map_data = st_folium(m, height=480, use_container_width=True, returned_objects=["last_clicked"])
 if map_data and map_data.get("last_clicked"):
     new_point = {"lat": round(map_data["last_clicked"]["lat"], 5), "lon": round(map_data["last_clicked"]["lng"], 5)}
@@ -217,7 +298,8 @@ try:
     with st.spinner("Recupero coordinate, quota, meteo e centraline..."):
         locality, region, address = reverse_geocode(p["lat"], p["lon"])
         raw = open_meteo(p["lat"], p["lon"])
-except requests.RequestException as exc:
+        terrain = terrain_analysis(p["lat"], p["lon"])
+except (requests.RequestException, ValueError) as exc:
     st.error(f"Errore nel recupero dei dati di base: {exc}")
     st.stop()
 
@@ -225,7 +307,9 @@ if region not in REGIONI:
     st.error(f"Il punto risulta in {region or 'una regione non identificata'}. Seleziona Piemonte, Liguria, Lombardia o Emilia-Romagna.")
     st.stop()
 
-elevation = round(float(raw.get("elevation", 0)))
+elevation = round(float(terrain.get("elevation", raw.get("elevation", 0))))
+auto_exposure = terrain["aspect"]
+auto_exposure_bonus = terrain_bonus(auto_exposure, terrain["slope_deg"])
 st.subheader(locality)
 a, b, c, d = st.columns(4)
 a.metric("Regione", region)
@@ -233,6 +317,11 @@ b.metric("Quota punto", f"{elevation} m")
 c.metric("Latitudine", p["lat"])
 d.metric("Longitudine", p["lon"])
 st.caption(address)
+t1, t2, t3 = st.columns(3)
+t1.metric("Esposizione automatica", auto_exposure)
+t2.metric("Pendenza stimata", f"{terrain['slope_deg']:.1f}° / {terrain['slope_pct']:.0f}%")
+t3.metric("Correttivo versante", f"{auto_exposure_bonus:+d} punti")
+st.caption("Esposizione e pendenza stimate su griglia altimetrica locale; possono non rappresentare microforme del terreno.")
 
 candidates = pd.DataFrame()
 connector_message = None
@@ -284,12 +373,46 @@ else:
     else:
         st.warning(f"Nessuna centralina pluviometrica trovata entro {max_km} km. Uso Open-Meteo sul punto.")
 
-forecast = build_forecast(raw, observed)
+forecast = build_forecast(raw, observed, forest_type, auto_exposure_bonus)
 st.subheader("Indice per i prossimi 7 giorni")
 fig = px.line(forecast, x="Data", y="Indice", markers=True, range_y=[0, 100])
 fig.update_traces(line_color="#16825d", line_width=4, marker_size=10, fill="tozeroy", fillcolor="rgba(22,130,93,.16)")
 fig.update_layout(xaxis_title=None, yaxis_title="Indice (%)", hovermode="x unified")
 st.plotly_chart(fig, use_container_width=True)
+
+# Valori numerici sempre visibili sotto il grafico, con scala cromatica.
+def probability_style(value):
+    if value >= 75:
+        return "#166534", "#dcfce7", "Molto alta"
+    if value >= 60:
+        return "#15803d", "#ecfccb", "Alta"
+    if value >= 45:
+        return "#a16207", "#fef9c3", "Media"
+    if value >= 30:
+        return "#c2410c", "#ffedd5", "Bassa"
+    return "#b91c1c", "#fee2e2", "Molto bassa"
+
+best_index = forecast["Indice"].idxmax()
+cols = st.columns(7)
+for position, (_, row) in enumerate(forecast.iterrows()):
+    fg, bg, label = probability_style(int(row["Indice"]))
+    best = row.name == best_index
+    border = "3px solid #166534" if best else "1px solid rgba(15,23,42,.10)"
+    badge = "<div style='font-size:.72rem;font-weight:800;margin-top:5px'>GIORNO MIGLIORE</div>" if best else ""
+    with cols[position]:
+        st.markdown(
+            f"<div style='background:{bg};color:{fg};border:{border};border-radius:14px;"
+            f"padding:10px 4px;text-align:center;min-height:112px'>"
+            f"<div style='font-size:.78rem;font-weight:700'>{row['Data'].strftime('%a %d/%m')}</div>"
+            f"<div style='font-size:1.65rem;font-weight:900;line-height:1.25'>{int(row['Indice'])}%</div>"
+            f"<div style='font-size:.72rem;font-weight:700'>{label}</div>{badge}</div>",
+            unsafe_allow_html=True,
+        )
+
+st.caption(
+    f"Correttivi applicati: bosco **{forest_type}**, esposizione automatica **{auto_exposure}**, pendenza **{terrain['slope_deg']:.1f}°**. "
+    "Il loro peso complessivo è volutamente limitato rispetto a pioggia, temperatura, umidità e vento."
+)
 
 st.subheader("Dettaglio giornaliero")
 for _, r in forecast.iterrows():
@@ -303,6 +426,7 @@ for _, r in forecast.iterrows():
         y1.metric("Umidità aria", f"{int(r['Umidità aria (%)'])}%")
         y2.metric("Umidità suolo", r["Umidità suolo"])
         y3.metric("Vento massimo", f"{r['Vento max (km/h)']} km/h")
+        st.write(f"**Bosco:** {forest_type}  |  **Esposizione automatica:** {auto_exposure}  |  **Pendenza:** {terrain['slope_deg']:.1f}°")
 
 st.divider()
 st.caption("La pioggia osservata viene usata solo quando il connettore ufficiale restituisce dati validi. Le previsioni future, l'umidità del terreno e il fallback storico provengono da Open-Meteo. L'indice è sperimentale e non garantisce la presenza di funghi.")
