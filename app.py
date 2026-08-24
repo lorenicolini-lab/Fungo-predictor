@@ -1,11 +1,12 @@
 import math
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 import folium
 import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
+from meteostat import Daily, Point, Stations
 from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Previsione funghi", page_icon="🍄", layout="wide")
@@ -80,7 +81,45 @@ def scarica_meteo(lat, lon):
     return response.json()
 
 
-def prepara_dati(raw, tipo_bosco, esposizione):
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def scarica_osservazioni_stazione(lat, lon, quota):
+    """Recupera piogge osservate tramite Meteostat e identifica la stazione vicina.
+    Se non disponibili, restituisce dati vuoti e l'app mantiene il modello Open-Meteo.
+    """
+    fine = date.today() - timedelta(days=1)
+    inizio = fine - timedelta(days=40)
+    punto = Point(lat, lon, quota if quota else None)
+
+    osservati = Daily(punto, inizio, fine).fetch()
+    if osservati.empty or "prcp" not in osservati.columns:
+        return {}, None
+
+    osservati = osservati.reset_index()
+    osservati["data"] = pd.to_datetime(osservati["time"]).dt.date
+    piogge = {
+        r["data"]: float(r["prcp"])
+        for _, r in osservati.dropna(subset=["prcp"]).iterrows()
+    }
+
+    info = None
+    try:
+        vicine = Stations().nearby(lat, lon).fetch(1)
+        if not vicine.empty:
+            codice = str(vicine.index[0])
+            r = vicine.iloc[0]
+            info = {
+                "codice": codice,
+                "nome": str(r.get("name", codice)),
+                "lat": float(r.get("latitude")),
+                "lon": float(r.get("longitude")),
+            }
+    except Exception:
+        info = None
+
+    return piogge, info
+
+def prepara_dati(raw, tipo_bosco, esposizione, piogge_osservate=None):
     h = pd.DataFrame(raw["hourly"])
     h["time"] = pd.to_datetime(h["time"])
     h["data"] = h["time"].dt.date
@@ -100,8 +139,14 @@ def prepara_dati(raw, tipo_bosco, esposizione):
     )
     futuro = futuro.merge(medie, on="data", how="left")
 
-    piogge_storiche = storico.set_index("data")["precipitation_sum"].to_dict()
-    tutte_piogge = d.set_index("data")["precipitation_sum"].to_dict()
+    tutte_piogge = d.set_index("data")["precipitation_sum"].fillna(0).to_dict()
+    # Le osservazioni prevalgono sul modello per tutte le date storiche disponibili.
+    piogge_osservate = piogge_osservate or {}
+    tutte_piogge.update(piogge_osservate)
+    if piogge_osservate:
+        storico["precipitation_sum"] = storico.apply(
+            lambda r: piogge_osservate.get(r["data"], r["precipitation_sum"]), axis=1
+        )
 
     bonus_bosco = {"Faggio": 6, "Castagno": 5, "Quercia": 3, "Conifere": 2, "Misto": 5}.get(tipo_bosco, 0)
     bonus_esposizione = {"Nord": 4, "Nord-est": 3, "Est": 2, "Ovest": 0, "Sud": -5, "Non nota": 0}.get(esposizione, 0)
@@ -195,7 +240,13 @@ try:
     with st.spinner("Recupero località, quota e dati meteorologici..."):
         localita, regione, indirizzo = reverse_geocode(punto["lat"], punto["lon"])
         raw = scarica_meteo(punto["lat"], punto["lon"])
-        previsione, storico = prepara_dati(raw, tipo_bosco, esposizione)
+        quota_api = round(float(raw.get("elevation", 0)))
+        piogge_osservate, stazione = scarica_osservazioni_stazione(
+            punto["lat"], punto["lon"], quota_api
+        )
+        previsione, storico = prepara_dati(
+            raw, tipo_bosco, esposizione, piogge_osservate
+        )
 except requests.RequestException as exc:
     st.error(f"Impossibile recuperare i dati online: {exc}")
     st.stop()
@@ -212,6 +263,21 @@ c2.metric("Regione", regione)
 c3.metric("Quota modello", f"{quota} m")
 c4.metric("Coordinate", f"{punto['lat']}, {punto['lon']}")
 st.caption(indirizzo)
+
+if piogge_osservate:
+    if stazione:
+        st.success(
+            f"Pioggia storica corretta con osservazioni Meteostat. "
+            f"Stazione di riferimento più vicina: {stazione['nome']} "
+            f"({stazione['codice']}). Le previsioni future restano Open-Meteo."
+        )
+    else:
+        st.success("Pioggia storica corretta con osservazioni Meteostat; previsioni future da Open-Meteo.")
+else:
+    st.warning(
+        "Nessuna osservazione pluviometrica disponibile per questo punto: "
+        "per lo storico viene usato il modello Open-Meteo."
+    )
 
 st.subheader("Probabilità nei prossimi 7 giorni")
 fig = px.line(previsione, x="Data", y="Indice", markers=True, range_y=[0, 100])
@@ -252,4 +318,4 @@ with st.expander("Storico meteorologico degli ultimi 30 giorni"):
     st.dataframe(storico_plot.sort_values("Data", ascending=False), use_container_width=True, hide_index=True)
 
 st.divider()
-st.caption("Indice sperimentale e non garanzia di presenza di funghi. Verifica sempre permessi, limiti di raccolta, accessibilità e regole locali. Dati meteo ed elevazione: Open-Meteo. Cartografia: OpenStreetMap.")
+st.caption("Indice sperimentale e non garanzia di presenza di funghi. Pioggia storica: osservazioni Meteostat quando disponibili, con fallback Open-Meteo. Previsioni ed elevazione: Open-Meteo. Cartografia: OpenStreetMap. Verifica sempre permessi, limiti e regole locali.")
