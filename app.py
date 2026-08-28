@@ -1,531 +1,206 @@
-from datetime import date, timedelta
-import math
-import re
-import xml.etree.ElementTree as ET
-
-import folium
-import pandas as pd
-import plotly.express as px
-import requests
-import streamlit as st
+from datetime import date, datetime, timedelta
+import csv, math, os, re, uuid, xml.etree.ElementTree as ET
+import folium, pandas as pd, plotly.express as px, requests, streamlit as st
 from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Fungo Predictor", page_icon="🍄", layout="wide")
-
-OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
-ELEVATION_API = "https://api.open-meteo.com/v1/elevation"
-NOMINATIM = "https://nominatim.openstreetmap.org/reverse"
-LOMBARDIA_STAZIONI = "https://www.dati.lombardia.it/resource/nf78-nj6b.json"
-LOMBARDIA_DATI = "https://www.dati.lombardia.it/resource/647i-nhxk.json"
-LOMBARDIA_FOREST_WMS = "https://www.cartografia.servizirl.it/arcgis2/services/agricoltura/carta_forestale/MapServer/WMSServer"
-EMILIA_VEGETATION_WFS = "https://servizigis.regione.emilia-romagna.it/wfs/carta_della_vegetazione"
-REGIONI = {"Piemonte", "Liguria", "Lombardia", "Emilia-Romagna", "Emilia Romagna"}
-HEADERS = {"User-Agent": "fungo-predictor/3.0 (Streamlit; regional-open-data-client)"}
+OPEN_METEO="https://api.open-meteo.com/v1/forecast"
+ELEVATION="https://api.open-meteo.com/v1/elevation"
+NOMINATIM="https://nominatim.openstreetmap.org/reverse"
+LOMB_WMS="https://www.cartografia.servizirl.it/arcgis2/services/agricoltura/carta_forestale/MapServer/WMSServer"
+EMILIA_WFS="https://servizigis.regione.emilia-romagna.it/wfs/carta_della_vegetazione"
+HEADERS={"User-Agent":"fungo-predictor/4.0"}
+OBS="fungo_observations.csv"; HIST="fungo_forecast_history.csv"
+FORESTS=["Non nota","Faggio","Castagno","Quercia","Conifere","Bosco misto"]
 
 
-def clamp(value, low=0, high=100):
-    return max(low, min(high, value))
+def clamp(x,a=0,b=100): return max(a,min(b,x))
+def haversine(a,b,c,d):
+    r=6371.0088; p1,p2=math.radians(a),math.radians(c); dp=math.radians(c-a); dl=math.radians(d-b)
+    return 2*r*math.asin(math.sqrt(math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2))
 
+def append_csv(path,row,cols):
+    exists=os.path.exists(path) and os.path.getsize(path)>0
+    with open(path,"a",newline="",encoding="utf-8-sig") as f:
+        w=csv.DictWriter(f,fieldnames=cols,extrasaction="ignore")
+        if not exists: w.writeheader()
+        w.writerow({c:row.get(c,"") for c in cols})
 
-def haversine(lat1, lon1, lat2, lon2):
-    r = 6371.0088
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
-    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * r * math.asin(math.sqrt(a))
+def load_csv(path,cols):
+    if not os.path.exists(path): return pd.DataFrame(columns=cols)
+    try: return pd.read_csv(path)
+    except Exception: return pd.DataFrame(columns=cols)
 
+@st.cache_data(ttl=3600,show_spinner=False)
+def geocode(lat,lon):
+    r=requests.get(NOMINATIM,params={"lat":lat,"lon":lon,"format":"jsonv2","zoom":10,"addressdetails":1},headers=HEADERS,timeout=20); r.raise_for_status()
+    j=r.json(); a=j.get("address",{}); reg=a.get("state","").replace("Emilia Romagna","Emilia-Romagna")
+    loc=a.get("village") or a.get("town") or a.get("city") or a.get("municipality") or a.get("county") or "Punto selezionato"
+    return loc,reg,j.get("display_name",loc)
 
-def first(row, names, default=None):
-    for name in names:
-        if name in row and pd.notna(row[name]) and str(row[name]).strip():
-            return row[name]
-    return default
+@st.cache_data(ttl=1800,show_spinner=False)
+def meteo(lat,lon):
+    q={"latitude":lat,"longitude":lon,"hourly":"temperature_2m,relative_humidity_2m,precipitation,soil_moisture_9_to_27cm,wind_speed_10m","daily":"temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max","past_days":40,"forecast_days":7,"timezone":"Europe/Rome"}
+    r=requests.get(OPEN_METEO,params=q,timeout=30); r.raise_for_status(); return r.json()
 
+@st.cache_data(ttl=86400,show_spinner=False)
+def terrain(lat,lon,step=120):
+    dy=step/111320; dx=step/(111320*math.cos(math.radians(lat)))
+    pts=[(lat+y*dy,lon+x*dx) for y in (-1,0,1) for x in (-1,0,1)]
+    r=requests.get(ELEVATION,params={"latitude":','.join(f'{x[0]:.6f}' for x in pts),"longitude":','.join(f'{x[1]:.6f}' for x in pts)},timeout=30); r.raise_for_status(); z=r.json()["elevation"]
+    west,east=(z[0]+2*z[3]+z[6])/4,(z[2]+2*z[5]+z[8])/4; south,north=(z[0]+2*z[1]+z[2])/4,(z[6]+2*z[7]+z[8])/4
+    zx,zy=(east-west)/(2*step),(north-south)/(2*step); sd=math.degrees(math.atan(math.sqrt(zx*zx+zy*zy))); ad=(math.degrees(math.atan2(-zx,-zy))+360)%360
+    names=["Nord","Nord-est","Est","Sud-est","Sud","Sud-ovest","Ovest","Nord-ovest"]; asp="Pianeggiante" if sd<2 else names[int((ad+22.5)//45)%8]
+    return {"elevation":z[4],"slope_deg":sd,"slope_pct":math.tan(math.radians(sd))*100,"aspect":asp}
 
-def normalize_region(region):
-    return "Emilia-Romagna" if region == "Emilia Romagna" else region
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def reverse_geocode(lat, lon):
-    response = requests.get(
-        NOMINATIM,
-        params={"lat": lat, "lon": lon, "format": "jsonv2", "zoom": 10, "addressdetails": 1},
-        headers=HEADERS,
-        timeout=20,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    address = payload.get("address", {})
-    region = normalize_region(address.get("state", ""))
-    locality = (address.get("village") or address.get("town") or address.get("city")
-                or address.get("municipality") or address.get("county") or "Punto selezionato")
-    return locality, region, payload.get("display_name", locality)
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def open_meteo(lat, lon):
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "temperature_2m,relative_humidity_2m,precipitation,soil_moisture_9_to_27cm,wind_speed_10m",
-        "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max",
-        "past_days": 40,
-        "forecast_days": 7,
-        "timezone": "Europe/Rome",
-    }
-    response = requests.get(OPEN_METEO, params=params, timeout=30)
-    response.raise_for_status()
-    return response.json()
-
-
-@st.cache_data(ttl=21600, show_spinner=False)
-def lombardia_stations():
-    response = requests.get(LOMBARDIA_STAZIONI, params={"$limit": 50000}, timeout=45)
-    response.raise_for_status()
-    raw = pd.DataFrame(response.json())
-    if raw.empty:
-        return pd.DataFrame()
-    raw.columns = [str(c).lower() for c in raw.columns]
-    records = []
-    for _, row in raw.iterrows():
-        sensor_type = str(first(row, ["tipologia", "nometiposensore", "tipo_sensore", "misura"], "")).lower()
-        unit = str(first(row, ["unitamisura", "unit_misura", "unita_misura"], "")).lower()
-        if "precip" not in sensor_type and "piogg" not in sensor_type and unit != "mm":
-            continue
-        try:
-            lat = float(str(first(row, ["lat", "latitude", "latitudine"])).replace(",", "."))
-            lon = float(str(first(row, ["lng", "lon", "longitude", "longitudine"])).replace(",", "."))
-            elevation = float(str(first(row, ["quota", "altitudine"], 0)).replace(",", "."))
-            sensor_id = str(first(row, ["idsensore", "id_sensore"]))
-            station_name = str(first(row, ["nomestazione", "nome_stazione", "stazione"], sensor_id))
-        except (TypeError, ValueError):
-            continue
-        records.append({"sensor_id": sensor_id, "station": station_name, "lat": lat, "lon": lon,
-                        "elevation": elevation, "network": "ARPA Lombardia"})
-    return pd.DataFrame(records).drop_duplicates("sensor_id") if records else pd.DataFrame()
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def lombardia_rain(sensor_id, start_day, end_day):
-    start_iso = f"{start_day.isoformat()}T00:00:00"
-    end_iso = f"{(end_day + timedelta(days=1)).isoformat()}T00:00:00"
-    where = f"idsensore='{sensor_id}' AND data >= '{start_iso}' AND data < '{end_iso}'"
-    response = requests.get(LOMBARDIA_DATI, params={"$where": where, "$limit": 50000, "$order": "data ASC"}, timeout=45)
-    response.raise_for_status()
-    df = pd.DataFrame(response.json())
-    if df.empty:
-        return pd.DataFrame(columns=["date", "rain"])
-    df.columns = [str(c).lower() for c in df.columns]
-    df["date"] = pd.to_datetime(df["data"], errors="coerce").dt.date
-    df["value"] = pd.to_numeric(df["valore"], errors="coerce")
-    if "stato" in df:
-        df = df[df["stato"].isin(["VA", "VV"])]
-    df = df[(df["value"] >= 0) & (df["value"] < 1000)].copy()
-    if "idoperatore" in df and (df["idoperatore"].astype(str) == "4").any():
-        daily = df.groupby("date", as_index=False)["value"].max()
-    else:
-        daily = df.groupby("date", as_index=False)["value"].sum()
-    return daily.rename(columns={"value": "rain"})
-
-
-def nearest_candidates(stations, lat, lon, elevation, max_km):
-    if stations.empty:
-        return stations
-    out = stations.copy()
-    out["distance_km"] = out.apply(lambda r: haversine(lat, lon, r["lat"], r["lon"]), axis=1)
-    out["elevation_diff_m"] = out["elevation"] - elevation
-    out = out[out["distance_km"] <= max_km].copy()
-    out["score"] = out["distance_km"] + out["elevation_diff_m"].abs() / 100.0
-    return out.sort_values(["score", "distance_km"]).reset_index(drop=True)
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def terrain_analysis(lat, lon, spacing_m=120):
-    lat_step = spacing_m / 111320.0
-    lon_step = spacing_m / (111320.0 * math.cos(math.radians(lat)))
-    points = [(lat + dy * lat_step, lon + dx * lon_step) for dy in (-1, 0, 1) for dx in (-1, 0, 1)]
-    response = requests.get(
-        ELEVATION_API,
-        params={"latitude": ",".join(f"{x[0]:.6f}" for x in points),
-                "longitude": ",".join(f"{x[1]:.6f}" for x in points)},
-        timeout=30,
-    )
-    response.raise_for_status()
-    z = response.json().get("elevation", [])
-    if len(z) != 9 or any(v is None for v in z):
-        raise ValueError("Griglia altimetrica incompleta")
-    west, east = (z[0] + 2*z[3] + z[6])/4, (z[2] + 2*z[5] + z[8])/4
-    south, north = (z[0] + 2*z[1] + z[2])/4, (z[6] + 2*z[7] + z[8])/4
-    dzdx, dzdy = (east-west)/(2*spacing_m), (north-south)/(2*spacing_m)
-    slope_rad = math.atan(math.sqrt(dzdx**2 + dzdy**2))
-    slope_deg, slope_pct = math.degrees(slope_rad), math.tan(slope_rad)*100
-    aspect_deg = (math.degrees(math.atan2(-dzdx, -dzdy)) + 360) % 360
-    names = ["Nord", "Nord-est", "Est", "Sud-est", "Sud", "Sud-ovest", "Ovest", "Nord-ovest"]
-    aspect = "Pianeggiante" if slope_deg < 2 else names[int((aspect_deg + 22.5)//45) % 8]
-    return {"elevation": float(z[4]), "slope_deg": slope_deg, "slope_pct": slope_pct,
-            "aspect": aspect, "aspect_deg": aspect_deg}
-
-
-def terrain_bonus(aspect, slope_deg):
-    base = {"Nord": 4, "Nord-est": 3, "Nord-ovest": 3, "Est": 2, "Ovest": 0,
-            "Sud-est": -3, "Sud-ovest": -3, "Sud": -4, "Pianeggiante": 0}.get(aspect, 0)
-    factor = clamp(slope_deg / 18.0, 0.25, 1.5) if slope_deg >= 2 else 0
-    return round(base * factor)
-
-
-# ---------------- RICONOSCIMENTO AUTOMATICO DEL BOSCO ----------------
-
-def forest_class_from_text(text):
-    """Riduce la descrizione regionale alle classi usate dal modello."""
-    t = re.sub(r"\s+", " ", str(text or "")).strip().lower()
-    if not t:
-        return "Non nota"
-    if any(k in t for k in ["fagget", "fagus", "faggio"]):
-        return "Faggio"
-    if any(k in t for k in ["castagnet", "castanea", "castagno"]):
-        return "Castagno"
-    if any(k in t for k in ["querc", "rover", "cerret", "farnia", "leccio", "quercus"]):
-        return "Quercia"
-    if any(k in t for k in ["conifer", "peccet", "abiet", "laric", "pineta", "pino", "abete", "larice", "picea"]):
-        return "Conifere"
-    if any(k in t for k in ["misto", "mista", "latifoglie", "bosco", "forest"]):
-        return "Bosco misto"
+def forest_class(text):
+    t=re.sub(r"\s+"," ",str(text or "")).lower()
+    for keys,val in [(["fagget","fagus","faggio"],"Faggio"),(["castagnet","castanea","castagno"],"Castagno"),(["querc","rover","cerret","farnia","leccio"],"Quercia"),(["conifer","peccet","abiet","laric","pineta","pino","abete","larice"],"Conifere"),(["misto","mista","latifoglie","bosco","forest"],"Bosco misto")]:
+        if any(k in t for k in keys): return val
     return "Non nota"
 
+def best_desc(props):
+    if not isinstance(props,dict): return ""
+    vals=[]
+    for k,v in props.items():
+        if v is None or isinstance(v,(dict,list)): continue
+        v=str(v).strip()
+        if v: vals.append((0 if forest_class(v)!="Non nota" else 1,0 if any(x in k.lower() for x in ["descr","tipo","categoria","veget","nome","classe"]) else 1,-len(v),v))
+    return sorted(vals)[0][3] if vals else ""
 
-def best_forest_description(properties):
-    """Sceglie il campo descrittivo senza dipendere dai nomi degli attributi regionali."""
-    if not isinstance(properties, dict):
-        return ""
-    preferred = ["descr", "tipo", "tipologia", "categoria", "formazione", "veget", "habitat", "nome", "label", "classe"]
-    candidates = []
-    for key, value in properties.items():
-        if value is None or isinstance(value, (dict, list)):
-            continue
-        value = str(value).strip()
-        if not value or value.lower() in {"null", "none", "-"}:
-            continue
-        key_l = str(key).lower()
-        priority = next((i for i, word in enumerate(preferred) if word in key_l), 99)
-        forest_match = forest_class_from_text(value) != "Non nota"
-        candidates.append((0 if forest_match else 1, priority, -len(value), value))
-    return sorted(candidates)[0][3] if candidates else ""
+@st.cache_data(ttl=86400,show_spinner=False)
+def emilia_types():
+    r=requests.get(EMILIA_WFS,params={"service":"WFS","request":"GetCapabilities"},timeout=40); r.raise_for_status(); root=ET.fromstring(r.content); out=[]
+    for e in root.iter():
+        if e.tag.split("}")[-1]=="FeatureType":
+            n=next((c.text.strip() for c in e if c.tag.split("}")[-1]=="Name" and c.text),None)
+            if n: out.append(n)
+    return sorted(out,key=lambda n:0 if any(k in n.lower() for k in ["veget","forest","bosco"]) else 1)
 
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def emilia_feature_types():
-    r = requests.get(EMILIA_VEGETATION_WFS, params={"service": "WFS", "request": "GetCapabilities"}, timeout=45)
-    r.raise_for_status()
-    root = ET.fromstring(r.content)
-    names = []
-    for el in root.iter():
-        if el.tag.split("}")[-1] == "FeatureType":
-            for child in el:
-                if child.tag.split("}")[-1] == "Name" and child.text:
-                    names.append(child.text.strip())
-                    break
-    preferred = [n for n in names if any(k in n.lower() for k in ["veget", "forest", "bosco"])]
-    return preferred + [n for n in names if n not in preferred]
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def emilia_forest_lookup(lat, lon):
-    eps = 0.00012
-    bbox = f"{lon-eps},{lat-eps},{lon+eps},{lat+eps},EPSG:4326"
-    errors = []
-    for type_name in emilia_feature_types()[:12]:
-        params = {"service": "WFS", "version": "2.0.0", "request": "GetFeature",
-                  "typeNames": type_name, "outputFormat": "application/json", "count": 1,
-                  "srsName": "EPSG:4326", "bbox": bbox}
-        try:
-            r = requests.get(EMILIA_VEGETATION_WFS, params=params, timeout=35)
-            if r.status_code >= 400:
-                errors.append(f"{type_name}: HTTP {r.status_code}")
-                continue
-            payload = r.json()
-            features = payload.get("features", [])
-            if not features:
-                continue
-            props = features[0].get("properties", {})
-            raw = best_forest_description(props)
-            return {"forest_raw": raw or "Vegetazione cartografata", "forest_class": forest_class_from_text(raw),
-                    "source": "Carta della vegetazione Emilia-Romagna", "layer": type_name, "automatic": True}
-        except (requests.RequestException, ValueError) as exc:
-            errors.append(str(exc))
-    return {"forest_raw": "Nessun poligono forestale trovato nel punto", "forest_class": "Non nota",
-            "source": "Carta della vegetazione Emilia-Romagna", "layer": "", "automatic": True,
-            "warning": errors[-1] if errors else "Punto non classificato"}
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def lombardia_wms_layers():
-    r = requests.get(LOMBARDIA_FOREST_WMS,
-                     params={"service": "WMS", "request": "GetCapabilities", "version": "1.3.0"}, timeout=45)
-    r.raise_for_status()
-    root = ET.fromstring(r.content)
-    layers = []
-    for layer in root.iter():
-        if layer.tag.split("}")[-1] != "Layer":
-            continue
-        name = title = ""
-        for child in layer:
-            tag = child.tag.split("}")[-1]
-            if tag == "Name" and child.text:
-                name = child.text.strip()
-            elif tag == "Title" and child.text:
-                title = child.text.strip()
-        if name:
-            layers.append((name, title))
-    preferred = [x for x in layers if any(k in (x[0] + " " + x[1]).lower() for k in ["forest", "bosco", "tipo"])]
-    return preferred + [x for x in layers if x not in preferred]
-
-
-def parse_feature_info(response):
-    ctype = response.headers.get("content-type", "").lower()
-    if "json" in ctype or response.text.lstrip().startswith(("{", "[")):
-        payload = response.json()
-        features = payload.get("features", []) if isinstance(payload, dict) else []
-        if features:
-            return features[0].get("properties", {}) or features[0].get("attributes", {})
-    try:
-        root = ET.fromstring(response.content)
-        props = {}
-        for el in root.iter():
-            if len(el) == 0 and el.text and el.text.strip():
-                props[el.tag.split("}")[-1]] = el.text.strip()
-        return props
-    except ET.ParseError:
-        return {}
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def lombardia_forest_lookup(lat, lon):
-    delta = 0.002
-    bbox = f"{lat-delta},{lon-delta},{lat+delta},{lon+delta}"  # WMS 1.3.0 + EPSG:4326: lat,lon
-    errors = []
-    for layer_name, layer_title in lombardia_wms_layers()[:15]:
-        base = {"service": "WMS", "version": "1.3.0", "request": "GetFeatureInfo",
-                "layers": layer_name, "query_layers": layer_name, "styles": "",
-                "crs": "EPSG:4326", "bbox": bbox, "width": 101, "height": 101,
-                "i": 50, "j": 50, "feature_count": 1}
-        for info_format in ["application/json", "text/xml", "text/plain"]:
+@st.cache_data(ttl=86400,show_spinner=False)
+def forest_lookup(lat,lon,region):
+    if region=="Emilia-Romagna":
+        eps=.00015; bbox=f"{lon-eps},{lat-eps},{lon+eps},{lat+eps},EPSG:4326"
+        for layer in emilia_types()[:15]:
             try:
-                r = requests.get(LOMBARDIA_FOREST_WMS, params={**base, "info_format": info_format}, timeout=35)
-                if r.status_code >= 400:
-                    continue
-                props = parse_feature_info(r)
-                raw = best_forest_description(props)
-                if raw:
-                    return {"forest_raw": raw, "forest_class": forest_class_from_text(raw),
-                            "source": "Carta forestale Regione Lombardia", "layer": layer_title or layer_name,
-                            "automatic": True}
-            except (requests.RequestException, ValueError) as exc:
-                errors.append(str(exc))
-    return {"forest_raw": "Nessun poligono forestale trovato nel punto", "forest_class": "Non nota",
-            "source": "Carta forestale Regione Lombardia", "layer": "", "automatic": True,
-            "warning": errors[-1] if errors else "Punto non classificato"}
+                r=requests.get(EMILIA_WFS,params={"service":"WFS","version":"2.0.0","request":"GetFeature","typeNames":layer,"outputFormat":"application/json","count":1,"srsName":"EPSG:4326","bbox":bbox},timeout=30)
+                if r.ok:
+                    fs=r.json().get("features",[])
+                    if fs:
+                        raw=best_desc(fs[0].get("properties",{})); return {"raw":raw or "Vegetazione cartografata","type":forest_class(raw),"source":"Carta vegetazione Emilia-Romagna","auto":True}
+            except Exception: pass
+        return {"raw":"Nessun poligono rilevato","type":"Non nota","source":"Carta vegetazione Emilia-Romagna","auto":True}
+    if region=="Lombardia":
+        try:
+            cap=requests.get(LOMB_WMS,params={"service":"WMS","request":"GetCapabilities","version":"1.3.0"},timeout=35); cap.raise_for_status(); root=ET.fromstring(cap.content); layers=[]
+            for e in root.iter():
+                if e.tag.split("}")[-1]=="Layer":
+                    name=next((c.text.strip() for c in e if c.tag.split("}")[-1]=="Name" and c.text),None)
+                    if name: layers.append(name)
+            d=.002; bbox=f"{lat-d},{lon-d},{lat+d},{lon+d}"
+            for layer in layers[:15]:
+                q={"service":"WMS","version":"1.3.0","request":"GetFeatureInfo","layers":layer,"query_layers":layer,"styles":"","crs":"EPSG:4326","bbox":bbox,"width":101,"height":101,"i":50,"j":50,"feature_count":1,"info_format":"application/json"}
+                r=requests.get(LOMB_WMS,params=q,timeout=30)
+                if r.ok:
+                    try: fs=r.json().get("features",[])
+                    except Exception: fs=[]
+                    if fs:
+                        raw=best_desc(fs[0].get("properties",{})); return {"raw":raw,"type":forest_class(raw),"source":"Carta forestale Lombardia","auto":True}
+        except Exception: pass
+        return {"raw":"Nessun poligono rilevato","type":"Non nota","source":"Carta forestale Lombardia","auto":True}
+    return {"raw":"Selezione manuale","type":"Non nota","source":"Utente","auto":False}
 
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def detect_forest_type(lat, lon, region):
-    region = normalize_region(region)
-    if region == "Lombardia":
-        return lombardia_forest_lookup(lat, lon)
-    if region == "Emilia-Romagna":
-        return emilia_forest_lookup(lat, lon)
-    return {"forest_raw": "Selezione manuale", "forest_class": "Non nota",
-            "source": "Inserimento utente", "layer": "", "automatic": False}
-
-
-def build_forecast(raw, observed_rain=None, forest_type="Non nota", exposure_bonus_value=0):
-    daily = pd.DataFrame(raw["daily"])
-    daily["time"] = pd.to_datetime(daily["time"])
-    daily["date"] = daily["time"].dt.date
-    hourly = pd.DataFrame(raw["hourly"])
-    hourly["time"] = pd.to_datetime(hourly["time"])
-    hourly["date"] = hourly["time"].dt.date
-    avg = hourly.groupby("date", as_index=False).agg(humidity=("relative_humidity_2m", "mean"),
-        soil=("soil_moisture_9_to_27cm", "mean"), temp=("temperature_2m", "mean"))
-    daily = daily.merge(avg, on="date", how="left")
-    rain = daily.set_index("date")["precipitation_sum"].fillna(0).astype(float).to_dict()
-    if observed_rain is not None and not observed_rain.empty:
-        rain.update(observed_rain.set_index("date")["rain"].astype(float).to_dict())
-    future = daily[daily["date"] >= date.today()].head(7).copy()
-    forest_bonus = {"Non nota": 0, "Faggio": 5, "Castagno": 4, "Quercia": 2,
-                    "Conifere": 1, "Bosco misto": 4}.get(forest_type, 0)
-    rows = []
-    for _, r in future.iterrows():
-        day = r["date"]
-        rain7 = sum(rain.get(day - timedelta(days=i), 0) for i in range(1, 8))
-        last_heavy = next((i for i in range(41) if rain.get(day - timedelta(days=i), 0) >= 10), None)
-        humidity = float(r["humidity"] if pd.notna(r["humidity"]) else 60)
-        soil = float(r["soil"] if pd.notna(r["soil"]) else 0.2)
-        temp = float(r["temp"] if pd.notna(r["temp"]) else 16)
-        wind = float(r["wind_speed_10m_max"] if pd.notna(r["wind_speed_10m_max"]) else 10)
-        wait_score = 18 if last_heavy is not None and 5 <= last_heavy <= 12 else 8
-        score = clamp(rain7/50*32, 0, 32) + wait_score + clamp((humidity-45)/40*18, 0, 18)
-        score += clamp((soil-.10)/.28*16, 0, 16) + clamp(14-abs(temp-16)*1.8, 0, 14)
-        score -= clamp((wind-12)*.8, 0, 10)
-        score += forest_bonus + exposure_bonus_value
-        rows.append({"Data": pd.Timestamp(day), "Indice": round(clamp(score)),
-            "Pioggia prevista (mm)": round(float(r["precipitation_sum"] or 0), 1),
-            "Pioggia 7 gg precedenti (mm)": round(rain7, 1), "Giorni da pioggia >10 mm": last_heavy,
-            "T min (°C)": round(float(r["temperature_2m_min"]), 1),
-            "T max (°C)": round(float(r["temperature_2m_max"]), 1),
-            "Umidità aria (%)": round(humidity), "Umidità suolo": round(soil, 3),
-            "Vento max (km/h)": round(wind, 1)})
+def build_forecast(raw,forest,aspect,slope):
+    d=pd.DataFrame(raw["daily"]); d["date"]=pd.to_datetime(d["time"]).dt.date
+    h=pd.DataFrame(raw["hourly"]); h["date"]=pd.to_datetime(h["time"]).dt.date
+    a=h.groupby("date",as_index=False).agg(humidity=("relative_humidity_2m","mean"),soil=("soil_moisture_9_to_27cm","mean"),temp=("temperature_2m","mean")); d=d.merge(a,on="date")
+    rain=d.set_index("date")["precipitation_sum"].fillna(0).to_dict(); future=d[d.date>=date.today()].head(7); fb={"Faggio":5,"Castagno":4,"Quercia":2,"Conifere":1,"Bosco misto":4}.get(forest,0)
+    ab={"Nord":4,"Nord-est":3,"Nord-ovest":3,"Est":2,"Sud-est":-3,"Sud-ovest":-3,"Sud":-4}.get(aspect,0)*clamp(slope/18,.25,1.5) if slope>=2 else 0
+    rows=[]
+    for _,r in future.iterrows():
+        day=r.date; r7=sum(rain.get(day-timedelta(days=i),0) for i in range(1,8)); heavy=next((i for i in range(41) if rain.get(day-timedelta(days=i),0)>=10),None); hum=float(r.humidity); soil=float(r.soil); temp=float(r.temp); wind=float(r.wind_speed_10m_max)
+        score=clamp(r7/50*32,0,32)+(18 if heavy is not None and 5<=heavy<=12 else 8)+clamp((hum-45)/40*18,0,18)+clamp((soil-.1)/.28*16,0,16)+clamp(14-abs(temp-16)*1.8,0,14)-clamp((wind-12)*.8,0,10)+fb+ab
+        rows.append({"Data":pd.Timestamp(day),"Indice":round(clamp(score)),"Pioggia prevista (mm)":round(float(r.precipitation_sum),1),"Pioggia 7 gg (mm)":round(r7,1),"T min":round(float(r.temperature_2m_min),1),"T max":round(float(r.temperature_2m_max),1),"Umidità (%)":round(hum),"Suolo":round(soil,3),"Vento":round(wind,1)})
     return pd.DataFrame(rows)
 
+HIST_COLS=["saved_at","forecast_date","lat","lon","locality","region","forecast_score","rain_7d_mm","forest_type","aspect","slope_deg"]
+OBS_COLS=["id","created_at","outing_date","time_slot","lat","lon","locality","region","elevation_m","forest_type","forest_raw","aspect","slope_deg","ground_condition","mushrooms_found","species","quantity","quantity_unit","maturity","notes","forecast_score","forecast_source","actual_score","prediction_error","absolute_error","assessment"]
 
-# ---------------- INTERFACCIA ----------------
-st.title("🍄 Fungo Predictor")
-st.caption("Seleziona un punto: quota, versante e tipo di bosco vengono rilevati automaticamente dove sono disponibili dati regionali.")
+def save_snapshot(df,lat,lon,loc,reg,forest,t):
+    old=load_csv(HIST,HIST_COLS); now=datetime.now().isoformat(timespec="seconds"); rows=[]
+    for _,r in df.iterrows(): rows.append({"saved_at":now,"forecast_date":r.Data.date().isoformat(),"lat":lat,"lon":lon,"locality":loc,"region":reg,"forecast_score":r.Indice,"rain_7d_mm":r["Pioggia 7 gg (mm)"],"forest_type":forest,"aspect":t["aspect"],"slope_deg":round(t["slope_deg"],1)})
+    pd.concat([old,pd.DataFrame(rows)]).drop_duplicates(["saved_at","forecast_date","lat","lon"]).to_csv(HIST,index=False,encoding="utf-8-sig")
 
-with st.sidebar:
-    st.header("Criteri centralina")
-    reasonable_km = st.slider("Raggio preferenziale", 5, 40, 15, 5)
-    max_km = st.slider("Raggio massimo di ricerca", 20, 100, 50, 5)
-    max_alt_diff = st.slider("Differenza quota preferenziale", 100, 1000, 250, 50)
-    st.caption("Il bosco è automatico in Lombardia ed Emilia-Romagna; resta manuale in Piemonte e Liguria.")
-    if st.button("Cancella punto", use_container_width=True):
-        for key in ["point", "source_choice", "station_id"]:
-            st.session_state.pop(key, None)
-        st.rerun()
+def saved_prediction(day,lat,lon):
+    h=load_csv(HIST,HIST_COLS)
+    if h.empty:return None
+    h=h[h.forecast_date.astype(str)==day.isoformat()].copy()
+    if h.empty:return None
+    h["distance"]=h.apply(lambda x:haversine(lat,lon,float(x.lat),float(x.lon)),axis=1); h=h[h.distance<=2]
+    if h.empty:return None
+    return h.sort_values("saved_at").iloc[-1]
 
-m = folium.Map(location=[44.75, 9.10], zoom_start=7, tiles="OpenStreetMap")
-if "point" in st.session_state:
-    p = st.session_state["point"]
-    folium.Marker([p["lat"], p["lon"]], tooltip="Punto selezionato",
-        icon=folium.Icon(color="red", icon="info-sign")).add_to(m)
-map_data = st_folium(m, height=480, use_container_width=True, returned_objects=["last_clicked"])
-if map_data and map_data.get("last_clicked"):
-    new_point = {"lat": round(map_data["last_clicked"]["lat"], 5), "lon": round(map_data["last_clicked"]["lng"], 5)}
-    if st.session_state.get("point") != new_point:
-        st.session_state["point"] = new_point
-        st.rerun()
-if "point" not in st.session_state:
-    st.info("Tocca la mappa nel punto del bosco da analizzare.")
-    st.stop()
+def actual_score(found,q,state):
+    if not found:return 0
+    return round(clamp(min(70,20+10*math.log1p(float(q)))+{"Nascita":15,"Maturi":10,"Misti":8,"Marci":-15}.get(state,0)))
 
-p = st.session_state["point"]
-try:
-    with st.spinner("Recupero coordinate, quota, meteo e cartografia forestale..."):
-        locality, region, address = reverse_geocode(p["lat"], p["lon"])
-        raw = open_meteo(p["lat"], p["lon"])
-        terrain = terrain_analysis(p["lat"], p["lon"])
-except (requests.RequestException, ValueError) as exc:
-    st.error(f"Errore nel recupero dei dati di base: {exc}")
-    st.stop()
-
-if region not in REGIONI:
-    st.error(f"Il punto risulta in {region or 'una regione non identificata'}. Seleziona Piemonte, Liguria, Lombardia o Emilia-Romagna.")
-    st.stop()
-
-# Il lookup automatico non blocca l'intera app se il geoportale è temporaneamente indisponibile.
-forest_info = detect_forest_type(p["lat"], p["lon"], region)
-if forest_info["automatic"]:
-    forest_type = forest_info["forest_class"]
-else:
-    forest_type = st.sidebar.selectbox("Prevalenza del bosco", ["Non nota", "Faggio", "Castagno", "Quercia", "Conifere", "Bosco misto"])
-    forest_info = {**forest_info, "forest_raw": forest_type, "forest_class": forest_type}
-
-elevation = round(float(terrain.get("elevation", raw.get("elevation", 0))))
-auto_exposure = terrain["aspect"]
-auto_exposure_bonus = terrain_bonus(auto_exposure, terrain["slope_deg"])
-
-st.subheader(locality)
-a, b, c, d = st.columns(4)
-a.metric("Regione", region); b.metric("Quota punto", f"{elevation} m")
-c.metric("Latitudine", p["lat"]); d.metric("Longitudine", p["lon"])
-st.caption(address)
-
-t1, t2, t3, t4 = st.columns(4)
-t1.metric("Esposizione automatica", auto_exposure)
-t2.metric("Pendenza stimata", f"{terrain['slope_deg']:.1f}° / {terrain['slope_pct']:.0f}%")
-t3.metric("Bosco", forest_type)
-t4.metric("Correttivo bosco", f"{ {'Faggio':5,'Castagno':4,'Quercia':2,'Conifere':1,'Bosco misto':4}.get(forest_type,0):+d} punti")
-if forest_info["automatic"]:
-    st.info(f"Bosco rilevato automaticamente: **{forest_info['forest_raw']}** → categoria modello **{forest_type}**. Fonte: {forest_info['source']}.")
-    if forest_info.get("warning"):
-        st.warning(f"Cartografia forestale: {forest_info['warning']}. Il modello prosegue senza bonus bosco.")
-else:
-    st.info("Per Piemonte e Liguria il tipo di bosco resta selezionabile manualmente.")
-
-candidates = pd.DataFrame(); connector_message = None
-if region == "Lombardia":
-    try:
-        candidates = nearest_candidates(lombardia_stations(), p["lat"], p["lon"], elevation, max_km)
-    except requests.RequestException as exc:
-        connector_message = f"Servizio ARPA Lombardia momentaneamente non raggiungibile: {exc}"
-else:
-    connector_message = f"Connettore pluviometrico automatico {region} non disponibile: uso Open-Meteo sul punto."
-
-observed = None
-if not candidates.empty:
-    options = {}
-    for _, r in candidates.head(10).iterrows():
-        label = f"{r['station']} | {r['distance_km']:.1f} km | quota {r['elevation']:.0f} m | Δ {r['elevation_diff_m']:+.0f} m"
-        options[label] = r
-    label = st.selectbox("Centraline pluviometriche ufficiali disponibili", list(options))
-    selected_station = options[label]
-    recommended = selected_station["distance_km"] <= reasonable_km and abs(selected_station["elevation_diff_m"]) <= max_alt_diff
-    source = st.radio("Fonte per la pioggia storica", ["Centralina reale", "Open-Meteo sul punto"],
-                      index=0 if recommended else 1, horizontal=True)
-    if source == "Centralina reale":
-        try:
-            observed = lombardia_rain(selected_station["sensor_id"], date.today()-timedelta(days=40), date.today()-timedelta(days=1))
-            if observed.empty:
-                st.warning("La centralina non ha restituito dati validi. Uso Open-Meteo.")
-                observed = None
+def diary(p,loc,reg,elev,fi,forest,t,fc):
+    st.divider(); st.header("📚 Diario uscite e verifica del modello")
+    with st.expander("➕ Registra un'uscita reale"):
+        with st.form("outing"):
+            a,b=st.columns(2); day=a.date_input("Data dell'uscita",date.today(),max_value=date.today()); slot=b.radio("Momento",["Mattina","Pomeriggio"],horizontal=True)
+            a,b=st.columns(2); ground=a.selectbox("Condizioni bosco/terreno",["Secco","Umido","Molto umido","Bagnato"]); found=b.radio("Funghi trovati?",["Sì","No"],horizontal=True)=="Sì"
+            species=st.multiselect("Quali",["Porcino edulis","Porcino estivo","Porcino nero","Porcino pinicolo","Finferlo/Gallinaccio","Ovulo","Mazza di tamburo","Chiodino","Altro"],disabled=not found)
+            a,b,c=st.columns(3); q=a.number_input("Quanti",0.0,step=1.0,disabled=not found); unit=b.selectbox("Unità",["Esemplari","Grammi","Chilogrammi"],disabled=not found); state=c.selectbox("Stato",["Nascita","Maturi","Misti","Marci"],disabled=not found)
+            notes=st.text_area("Note"); submit=st.form_submit_button("Salva uscita",use_container_width=True)
+        if submit:
+            if found and (not species or q<=0): st.error("Indica almeno una specie e una quantità maggiore di zero.")
             else:
-                st.info(f"Fonte pioggia: {selected_station['network']} | {selected_station['station']} | distanza {selected_station['distance_km']:.1f} km")
-        except requests.RequestException as exc:
-            st.warning(f"Dati centralina non disponibili: {exc}. Uso Open-Meteo.")
-elif connector_message:
-    st.warning(connector_message)
+                snap=saved_prediction(day,p["lat"],p["lon"]); current=fc[fc.Data.dt.date==day]
+                pred=int(float(snap.forecast_score)) if snap is not None else (int(current.iloc[0].Indice) if not current.empty else None); source="Snapshot salvato" if snap is not None else ("Previsione corrente" if pred is not None else "Non disponibile")
+                real=actual_score(found,q,state if found else ""); err=real-pred if pred is not None else None; assess="Non confrontabile" if err is None else ("Previsione rispettata" if abs(err)<=10 else ("Risultato migliore del previsto" if err>0 else "Risultato peggiore del previsto"))
+                row={"id":str(uuid.uuid4()),"created_at":datetime.now().isoformat(timespec="seconds"),"outing_date":day.isoformat(),"time_slot":slot,"lat":p["lat"],"lon":p["lon"],"locality":loc,"region":reg,"elevation_m":elev,"forest_type":forest,"forest_raw":fi["raw"],"aspect":t["aspect"],"slope_deg":round(t["slope_deg"],1),"ground_condition":ground,"mushrooms_found":found,"species":"; ".join(species) if found else "Nessuno","quantity":q if found else 0,"quantity_unit":unit if found else "Esemplari","maturity":state if found else "Nessuno","notes":notes,"forecast_score":"" if pred is None else pred,"forecast_source":source,"actual_score":real,"prediction_error":"" if err is None else err,"absolute_error":"" if err is None else abs(err),"assessment":assess}
+                append_csv(OBS,row,OBS_COLS); st.success(f"Uscita salvata. {assess}.")
+                if pred is not None: st.write(f"Previsione **{pred}%** | esito reale normalizzato **{real}%** | scostamento **{err:+d} punti**")
+    obs=load_csv(OBS,OBS_COLS)
+    if obs.empty: st.info("Nessuna uscita registrata."); return
+    for c in ["forecast_score","actual_score","absolute_error"]: obs[c]=pd.to_numeric(obs[c],errors="coerce")
+    comp=obs.dropna(subset=["forecast_score","actual_score"]); a,b,c,d=st.columns(4); a.metric("Uscite",len(obs)); b.metric("Confrontabili",len(comp)); c.metric("Errore medio",f"{comp.absolute_error.mean():.1f} punti" if len(comp) else "n.d."); d.metric("Rispettate ±10",f"{(comp.absolute_error.le(10).mean()*100):.0f}%" if len(comp) else "n.d.")
+    if len(comp):
+        z=comp.copy(); z["Data"]=pd.to_datetime(z.outing_date); z=z.melt(id_vars="Data",value_vars=["forecast_score","actual_score"],var_name="Serie",value_name="Punteggio"); z.Serie=z.Serie.map({"forecast_score":"Previsione","actual_score":"Esito reale"}); st.plotly_chart(px.line(z,x="Data",y="Punteggio",color="Serie",markers=True,range_y=[0,100]),use_container_width=True)
+    st.dataframe(obs[["outing_date","time_slot","locality","ground_condition","species","quantity","quantity_unit","maturity","forecast_score","actual_score","assessment"]].sort_values("outing_date",ascending=False),hide_index=True,use_container_width=True)
+    st.download_button("Scarica database CSV",obs.to_csv(index=False).encode("utf-8-sig"),"fungo_observations.csv","text/csv",use_container_width=True)
 
-forecast = build_forecast(raw, observed, forest_type, auto_exposure_bonus)
-st.subheader("Indice per i prossimi 7 giorni")
-fig = px.line(forecast, x="Data", y="Indice", markers=True, range_y=[0, 100])
-fig.update_traces(line_color="#16825d", line_width=4, marker_size=10, fill="tozeroy", fillcolor="rgba(22,130,93,.16)")
-fig.update_layout(xaxis_title=None, yaxis_title="Indice (%)", hovermode="x unified")
-st.plotly_chart(fig, use_container_width=True)
+st.title("🍄 Fungo Predictor")
+st.caption("Previsione su mappa, riconoscimento del bosco e diario delle uscite reali.")
+with st.sidebar:
+    st.header("Impostazioni"); st.caption("Bosco automatico in Lombardia ed Emilia-Romagna.")
+    uploaded=st.file_uploader("Ripristina/integra database uscite",type="csv")
+    if uploaded and st.button("Importa database"):
+        up=pd.read_csv(uploaded); old=load_csv(OBS,OBS_COLS); pd.concat([old,up]).drop_duplicates("id",keep="last").to_csv(OBS,index=False,encoding="utf-8-sig"); st.success("Database importato")
+    if st.button("Cancella punto",use_container_width=True): st.session_state.pop("point",None); st.rerun()
 
-
-def probability_style(value):
-    if value >= 75: return "#166534", "#dcfce7", "Molto alta"
-    if value >= 60: return "#15803d", "#ecfccb", "Alta"
-    if value >= 45: return "#a16207", "#fef9c3", "Media"
-    if value >= 30: return "#c2410c", "#ffedd5", "Bassa"
-    return "#b91c1c", "#fee2e2", "Molto bassa"
-
-best_index = forecast["Indice"].idxmax()
-cols = st.columns(7)
-for position, (_, row) in enumerate(forecast.iterrows()):
-    fg, bg, label = probability_style(int(row["Indice"]))
-    border = "3px solid #166534" if row.name == best_index else "1px solid rgba(15,23,42,.10)"
-    badge = "<div style='font-size:.72rem;font-weight:800;margin-top:5px'>GIORNO MIGLIORE</div>" if row.name == best_index else ""
-    with cols[position]:
-        st.markdown(f"<div style='background:{bg};color:{fg};border:{border};border-radius:14px;padding:10px 4px;text-align:center;min-height:112px'>"
-                    f"<div style='font-size:.78rem;font-weight:700'>{row['Data'].strftime('%a %d/%m')}</div>"
-                    f"<div style='font-size:1.65rem;font-weight:900;line-height:1.25'>{int(row['Indice'])}%</div>"
-                    f"<div style='font-size:.72rem;font-weight:700'>{label}</div>{badge}</div>", unsafe_allow_html=True)
-
-st.caption(f"Correttivi applicati: bosco **{forest_type}**, esposizione **{auto_exposure}**, pendenza **{terrain['slope_deg']:.1f}°**.")
-st.subheader("Dettaglio giornaliero")
-for _, r in forecast.iterrows():
-    with st.expander(f"{r['Data'].strftime('%d/%m/%Y')} | indice {int(r['Indice'])}%"):
-        x1, x2, x3, x4 = st.columns(4)
-        x1.metric("Pioggia prevista", f"{r['Pioggia prevista (mm)']} mm")
-        x2.metric("Pioggia 7 giorni", f"{r['Pioggia 7 gg precedenti (mm)']} mm")
-        x3.metric("Ultima pioggia >10 mm", "Non trovata" if pd.isna(r["Giorni da pioggia >10 mm"]) else f"{int(r['Giorni da pioggia >10 mm'])} giorni fa")
-        x4.metric("Temperatura", f"{r['T min (°C)']} / {r['T max (°C)']} °C")
-        y1, y2, y3 = st.columns(3)
-        y1.metric("Umidità aria", f"{int(r['Umidità aria (%)'])}%")
-        y2.metric("Umidità suolo", r["Umidità suolo"])
-        y3.metric("Vento massimo", f"{r['Vento max (km/h)']} km/h")
-        st.write(f"**Bosco:** {forest_type} | **Classe cartografica:** {forest_info['forest_raw']} | **Esposizione:** {auto_exposure}")
-
-st.divider()
-st.caption("L'indice è sperimentale. Se la cartografia regionale non restituisce un poligono, il modello prosegue con bosco 'Non nota' e senza relativo bonus.")
+m=folium.Map([44.75,9.10],zoom_start=7)
+if "point" in st.session_state: folium.Marker([st.session_state.point["lat"],st.session_state.point["lon"]],icon=folium.Icon(color="red",icon="info-sign")).add_to(m)
+md=st_folium(m,height=480,use_container_width=True,returned_objects=["last_clicked"])
+if md and md.get("last_clicked"):
+    np={"lat":round(md["last_clicked"]["lat"],5),"lon":round(md["last_clicked"]["lng"],5)}
+    if st.session_state.get("point")!=np: st.session_state.point=np; st.rerun()
+if "point" not in st.session_state: st.info("Clicca sulla mappa nel punto da analizzare."); st.stop()
+p=st.session_state.point
+try:
+    with st.spinner("Recupero meteo, quota e vegetazione..."): loc,reg,address=geocode(p["lat"],p["lon"]); raw=meteo(p["lat"],p["lon"]); t=terrain(p["lat"],p["lon"]); fi=forest_lookup(p["lat"],p["lon"],reg)
+except Exception as e: st.error(f"Errore recupero dati: {e}"); st.stop()
+if reg not in {"Piemonte","Liguria","Lombardia","Emilia-Romagna"}: st.error(f"Punto fuori area: {reg or 'regione non riconosciuta'}"); st.stop()
+forest=fi["type"] if fi["auto"] else st.sidebar.selectbox("Tipo di bosco",FORESTS)
+if not fi["auto"]: fi={**fi,"raw":forest,"type":forest}
+elev=round(float(t["elevation"])); st.subheader(loc); a,b,c,d=st.columns(4); a.metric("Regione",reg); b.metric("Quota",f"{elev} m"); c.metric("Bosco",forest); d.metric("Esposizione",t["aspect"]); st.caption(address); st.info(f"Classe cartografica: **{fi['raw']}** | Fonte: {fi['source']} | Pendenza: **{t['slope_deg']:.1f}°**")
+fc=build_forecast(raw,forest,t["aspect"],t["slope_deg"]); save_snapshot(fc,p["lat"],p["lon"],loc,reg,forest,t)
+st.subheader("Indice prossimi 7 giorni"); fig=px.line(fc,x="Data",y="Indice",markers=True,range_y=[0,100]); fig.update_traces(line_color="#16825d",line_width=4,fill="tozeroy"); st.plotly_chart(fig,use_container_width=True)
+cols=st.columns(7)
+for i,(_,r) in enumerate(fc.iterrows()):
+    color="#dcfce7" if r.Indice>=60 else ("#fef9c3" if r.Indice>=40 else "#fee2e2")
+    cols[i].markdown(f"<div style='background:{color};padding:10px;border-radius:12px;text-align:center'><b>{r.Data.strftime('%d/%m')}</b><br><span style='font-size:1.5rem;font-weight:900'>{r.Indice}%</span></div>",unsafe_allow_html=True)
+st.dataframe(fc,hide_index=True,use_container_width=True)
+diary(p,loc,reg,elev,fi,forest,t,fc)
+st.caption("Nota: su Streamlit Community Cloud i file locali possono essere eliminati a ogni riavvio. Scarica periodicamente il CSV e reimportalo dalla barra laterale.")
